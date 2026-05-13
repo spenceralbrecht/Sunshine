@@ -10,6 +10,7 @@
 
 namespace stream {
   std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2);
+  bool should_terminate_for_missing_app(bool has_live_session, bool has_session_awaiting_peer, bool has_desktop_session, int running_app_id);
 }
 
 #include "../tests_common.h"
@@ -36,4 +37,20 @@ TEST(ConcatAndInsertTests, ConcatSmallStrideTest) {
   auto res = stream::concat_and_insert(1, 1, std::string_view {b1, sizeof(b1)}, std::string_view {b2, sizeof(b2)});
   auto expected = std::vector<uint8_t> {0, 'a', 0, 'b', 0, 'c', 0, 'd', 0, 'e'};
   ASSERT_EQ(res, expected);
+}
+
+TEST(StreamSessionTests, MissingAppTerminatesNonDesktopSession) {
+  EXPECT_TRUE(stream::should_terminate_for_missing_app(true, false, false, 0));
+}
+
+TEST(StreamSessionTests, MissingAppDoesNotTerminateDesktopSession) {
+  EXPECT_FALSE(stream::should_terminate_for_missing_app(true, false, true, 0));
+}
+
+TEST(StreamSessionTests, MissingAppDoesNotTerminatePendingSession) {
+  EXPECT_FALSE(stream::should_terminate_for_missing_app(true, true, false, 0));
+}
+
+TEST(StreamSessionTests, MissingAppDoesNotTerminateWithoutLiveSessions) {
+  EXPECT_FALSE(stream::should_terminate_for_missing_app(false, false, false, 0));
 }

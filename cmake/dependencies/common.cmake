@@ -21,6 +21,11 @@ find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(CURL REQUIRED libcurl)
+pkg_check_modules(OPUS REQUIRED opus)
+pkg_get_variable(OPUS_INCLUDEDIR opus includedir)
+if(NOT OPUS_INCLUDEDIR)
+    set(OPUS_INCLUDEDIR ${OPUS_INCLUDE_DIRS})
+endif()
 
 # miniupnp
 pkg_check_modules(MINIUPNP miniupnpc REQUIRED)

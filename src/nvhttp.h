@@ -200,4 +200,10 @@ namespace nvhttp {
    * @examples_end
    */
   void erase_all_clients();
+
+#ifdef SUNSHINE_TESTS
+  void test_add_pending_pair_session(pair_session_t sess);
+  std::size_t test_pending_pair_session_count();
+  void test_clear_pending_pair_sessions();
+#endif
 }  // namespace nvhttp

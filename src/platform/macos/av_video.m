@@ -67,6 +67,7 @@
     [screenInput release];
     return nil;
   }
+  [screenInput release];
 
   [self.session startRunning];
 
@@ -86,7 +87,9 @@
   self.frameHeight = frameHeight;
 }
 
-- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
+- (CaptureSession)capture:(FrameCallbackBlock)frameCallback {
+  CaptureSession captureSession = {nil, nil};
+
   @synchronized(self) {
     AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
 
@@ -101,25 +104,63 @@
     dispatch_queue_t recordingQueue = dispatch_queue_create("videoCaptureQueue", qos);
     [videoOutput setSampleBufferDelegate:self queue:recordingQueue];
 
-    [self.session stopRunning];
-
+    [self.session beginConfiguration];
     if ([self.session canAddOutput:videoOutput]) {
       [self.session addOutput:videoOutput];
     } else {
+      [self.session commitConfiguration];
       [videoOutput release];
-      return nil;
+      return captureSession;
     }
+    [self.session commitConfiguration];
 
     AVCaptureConnection *videoConnection = [videoOutput connectionWithMediaType:AVMediaTypeVideo];
+    if (!videoConnection) {
+      [self.session beginConfiguration];
+      [self.session removeOutput:videoOutput];
+      [self.session commitConfiguration];
+      [videoOutput release];
+      return captureSession;
+    }
+
     dispatch_semaphore_t signal = dispatch_semaphore_create(0);
 
     [self.videoOutputs setObject:videoOutput forKey:videoConnection];
     [self.captureCallbacks setObject:frameCallback forKey:videoConnection];
     [self.captureSignals setObject:signal forKey:videoConnection];
+    [videoOutput release];
 
-    [self.session startRunning];
+    captureSession.connection = videoConnection;
+    captureSession.signal = signal;
 
-    return signal;
+    return captureSession;
+  }
+}
+
+- (void)removeCaptureConnection:(AVCaptureConnection *)connection signal:(BOOL)shouldSignal {
+  AVCaptureVideoDataOutput *videoOutput = [self.videoOutputs objectForKey:connection];
+  dispatch_semaphore_t signal = [self.captureSignals objectForKey:connection];
+
+  [self.captureCallbacks removeObjectForKey:connection];
+  [self.videoOutputs removeObjectForKey:connection];
+  [self.captureSignals removeObjectForKey:connection];
+
+  if (videoOutput) {
+    [self.session beginConfiguration];
+    [self.session removeOutput:videoOutput];
+    [self.session commitConfiguration];
+  }
+
+  if (shouldSignal && signal) {
+    dispatch_semaphore_signal(signal);
+  }
+}
+
+- (void)cancelCapture:(CaptureSession)captureSession {
+  @synchronized(self) {
+    if (captureSession.connection) {
+      [self removeCaptureConnection:captureSession.connection signal:YES];
+    }
   }
 }
 
@@ -131,13 +172,7 @@
   if (callback != nil) {
     if (!callback(sampleBuffer)) {
       @synchronized(self) {
-        [self.session stopRunning];
-        [self.captureCallbacks removeObjectForKey:connection];
-        [self.session removeOutput:[self.videoOutputs objectForKey:connection]];
-        [self.videoOutputs removeObjectForKey:connection];
-        dispatch_semaphore_signal([self.captureSignals objectForKey:connection]);
-        [self.captureSignals removeObjectForKey:connection];
-        [self.session startRunning];
+        [self removeCaptureConnection:connection signal:YES];
       }
     }
   }

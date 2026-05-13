@@ -263,6 +263,13 @@ namespace stream {
     }
   }
 
+  constexpr auto control_shutdown_timeout = 2s;
+
+  bool should_terminate_for_missing_app(bool has_live_session, bool has_session_awaiting_peer, bool has_desktop_session, int running_app_id) {
+    // Desktop streaming sessions use appid=0 and intentionally have no launched child process.
+    return has_live_session && running_app_id == 0 && !has_session_awaiting_peer && !has_desktop_session;
+  }
+
   class control_server_t {
   public:
     int bind(net::af_e address_family, std::uint16_t port) {
@@ -342,6 +349,8 @@ namespace stream {
 
   struct session_t {
     config_t config;
+    int app_id {};
+    std::string unique_id;
 
     safe::mail_t mail;
 
@@ -411,6 +420,32 @@ namespace stream {
 
     std::atomic<session::state_e> state;
   };
+
+  static void force_shutdown_control_session(session_t &session) {
+    if (!session.broadcast_ref) {
+      session.controlEnd.raise(true);
+      return;
+    }
+
+    auto &control_server = session.broadcast_ref->control_server;
+    {
+      auto lg = control_server._sessions.lock();
+      auto &sessions = *control_server._sessions;
+      std::erase(sessions, &session);
+    }
+
+    if (session.control.peer) {
+      {
+        auto lg = control_server._peer_to_session.lock();
+        control_server._peer_to_session->erase(session.control.peer);
+      }
+
+      enet_peer_disconnect_now(session.control.peer, 0);
+      session.control.peer = nullptr;
+    }
+
+    session.controlEnd.raise(true);
+  }
 
   /**
    * First part of cipher must be struct of type control_encrypted_t
@@ -1063,7 +1098,9 @@ namespace stream {
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
+      bool has_live_session = false;
       bool has_session_awaiting_peer = false;
+      bool has_desktop_session = false;
 
       {
         auto lg = server->_sessions.lock();
@@ -1100,9 +1137,15 @@ namespace stream {
             continue;
           }
 
+          has_live_session = true;
+
           // Remember if we have a session that's waiting for a peer to connect to the
           // control stream. This ensures the clients are properly notified even when
           // the app terminates before they finish connecting.
+          if (session->app_id == 0) {
+            has_desktop_session = true;
+          }
+
           if (!session->control.peer) {
             has_session_awaiting_peer = true;
           } else {
@@ -1125,8 +1168,10 @@ namespace stream {
         })
       }
 
-      // Don't break until any pending sessions either expire or connect
-      if (proc::proc.running() == 0 && !has_session_awaiting_peer) {
+      // Only treat a missing launched process as terminal when we already have
+      // an active non-desktop session. Desktop sessions intentionally use
+      // appid=0 and have no launched child process to monitor.
+      if (should_terminate_for_missing_app(has_live_session, has_session_awaiting_peer, has_desktop_session, proc::proc.running())) {
         BOOST_LOG(info) << "Process terminated"sv;
         break;
       }
@@ -1785,6 +1830,8 @@ namespace stream {
   int recv_ping(session_t *session, decltype(broadcast)::ptr_t ref, socket_e type, std::string_view expected_payload, udp::endpoint &peer, std::chrono::milliseconds timeout) {
     auto messages = std::make_shared<message_queue_t::element_type>(30);
     av_session_id_t session_id = std::string {expected_payload};
+    auto shutdown_event = session->shutdown_event;
+    auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
 
     // Only allow matches on the peer address for legacy clients
     if (!(session->config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
@@ -1802,15 +1849,28 @@ namespace stream {
       ref->message_queue_queue->raise(type, session_id, nullptr);
     });
 
+    auto shutdown_requested = [&]() {
+      return shutdown_event->peek() || broadcast_shutdown_event->peek();
+    };
+
     auto start_time = std::chrono::steady_clock::now();
     auto current_time = start_time;
+    constexpr auto poll_interval = std::chrono::milliseconds {250};
 
-    while (current_time - start_time < config::stream.ping_timeout) {
-      auto delta_time = current_time - start_time;
+    while (current_time - start_time < timeout) {
+      if (shutdown_requested()) {
+        BOOST_LOG(debug) << "Cancelling ping wait during session shutdown"sv;
+        return -1;
+      }
 
-      auto msg_opt = messages->pop(config::stream.ping_timeout - delta_time);
+      auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - start_time);
+      auto remaining_time = timeout - elapsed_time;
+      auto wait_time = std::min(remaining_time, poll_interval);
+
+      auto msg_opt = messages->pop(wait_time);
+      current_time = std::chrono::steady_clock::now();
       if (!msg_opt) {
-        break;
+        continue;
       }
 
       TUPLE_2D_REF(recv_peer, msg, *msg_opt);
@@ -1822,13 +1882,17 @@ namespace stream {
         BOOST_LOG(debug) << "Received ping [v1] from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
       } else {
         BOOST_LOG(debug) << "Received non-ping from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
-        current_time = std::chrono::steady_clock::now();
         continue;
       }
 
       // Update connection details.
       peer = recv_peer;
       return 0;
+    }
+
+    if (shutdown_requested()) {
+      BOOST_LOG(debug) << "Ping wait ended due to session shutdown"sv;
+      return -1;
     }
 
     BOOST_LOG(error) << "Initial Ping Timeout"sv;
@@ -1884,6 +1948,10 @@ namespace stream {
       return session.state.load(std::memory_order_relaxed);
     }
 
+    std::string_view unique_id(session_t &session) {
+      return session.unique_id;
+    }
+
     void stop(session_t &session) {
       while_starting_do_nothing(session.state);
       auto expected = state_e::RUNNING;
@@ -1911,11 +1979,18 @@ namespace stream {
       });
 
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
-      session.videoThread.join();
-      BOOST_LOG(debug) << "Waiting for audio to end..."sv;
-      session.audioThread.join();
+      if (session.videoThread.joinable()) {
+        session.videoThread.join();
+      }
+      if (session.audioThread.joinable()) {
+        BOOST_LOG(debug) << "Waiting for audio to end..."sv;
+        session.audioThread.join();
+      }
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
-      session.controlEnd.view();
+      if (!session.controlEnd.view(control_shutdown_timeout)) {
+        BOOST_LOG(error) << "Timed out waiting for control stream shutdown; forcing session cleanup"sv;
+        force_shutdown_control_session(session);
+      }
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
@@ -1953,23 +2028,26 @@ namespace stream {
       session.control.expected_peer_address = addr_string;
       BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
 
-      // Insert this session into the session list
+      auto addr = boost::asio::ip::make_address(addr_string);
+      session.video.peer.address(addr);
+      session.video.peer.port(0);
+
+      session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+
+      // Publish the session only after fields read by the control thread are initialized.
       {
         auto lg = session.broadcast_ref->control_server._sessions.lock();
         session.broadcast_ref->control_server._sessions->push_back(&session);
       }
 
-      auto addr = boost::asio::ip::make_address(addr_string);
-      session.video.peer.address(addr);
-      session.video.peer.port(0);
-
-      session.audio.peer.address(addr);
-      session.audio.peer.port(0);
-
-      session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
-
-      session.audioThread = std::thread {audioThread, &session};
       session.videoThread = std::thread {videoThread, &session};
+      if (session.config.audio.channels > 0) {
+        session.audio.peer.address(addr);
+        session.audio.peer.port(0);
+        session.audioThread = std::thread {audioThread, &session};
+      } else {
+        BOOST_LOG(info) << "Starting silent session without audio thread"sv;
+      }
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
@@ -1993,6 +2071,8 @@ namespace stream {
       session->launch_session_id = launch_session.id;
 
       session->config = config;
+      session->app_id = launch_session.appid;
+      session->unique_id = launch_session.unique_id;
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);

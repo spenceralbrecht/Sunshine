@@ -137,6 +137,8 @@ include_directories(
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet/include"
         "${CMAKE_SOURCE_DIR}/third-party/nanors"
         "${CMAKE_SOURCE_DIR}/third-party/nanors/deps/obl"
+        ${OPENSSL_INCLUDE_DIR}
+        ${OPUS_INCLUDEDIR}
         ${FFMPEG_INCLUDE_DIRS}
         ${Boost_INCLUDE_DIRS}  # has to be the last, or we get runtime error on macOS ffmpeg encoder
 )
@@ -147,7 +149,7 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         enet
         libdisplaydevice::display_device
         nlohmann_json::nlohmann_json
-        opus
+        ${OPUS_LIBRARIES}
         ${FFMPEG_LIBRARIES}
         ${Boost_LIBRARIES}
         ${OPENSSL_LIBRARIES}

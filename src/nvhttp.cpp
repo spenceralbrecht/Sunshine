@@ -338,6 +338,35 @@ namespace nvhttp {
     map_id_sess.erase(sess.client.uniqueID);
   }
 
+  void clear_pending_pair_sessions() {
+    if (map_id_sess.empty()) {
+      return;
+    }
+
+    BOOST_LOG(info) << "Clearing "sv << map_id_sess.size() << " pending pairing session(s) before nvhttp shutdown"sv;
+
+    for (auto &[_, session] : map_id_sess) {
+      auto &async_response = session.async_insert_pin.response;
+      async_response = std::monostate {};
+    }
+
+    map_id_sess.clear();
+  }
+
+#ifdef SUNSHINE_TESTS
+  void test_add_pending_pair_session(pair_session_t sess) {
+    map_id_sess.emplace(sess.client.uniqueID, std::move(sess));
+  }
+
+  std::size_t test_pending_pair_session_count() {
+    return map_id_sess.size();
+  }
+
+  void test_clear_pending_pair_sessions() {
+    clear_pending_pair_sessions();
+  }
+#endif
+
   void fail_pair(pair_session_t &sess, pt::ptree &tree, const std::string status_msg) {
     tree.put("root.paired", 0);
     tree.put("root.<xmlattr>.status_code", 400);
@@ -668,7 +697,7 @@ namespace nvhttp {
     }
 
     // reset async_response
-    async_response = std::decay_t<decltype(async_response.left())>();
+    async_response = std::monostate {};
     // response to the current request
     return true;
   }
@@ -1185,6 +1214,12 @@ namespace nvhttp {
 
     ssl.join();
     tcp.join();
+
+    // Drop any pending /pair responses while the HTTP server objects still exist.
+    // Otherwise these response objects survive until process teardown and can crash
+    // during restart when their underlying Simple-Web connection state is destroyed
+    // after the server shutdown path has already begun.
+    clear_pending_pair_sessions();
   }
 
   void erase_all_clients() {

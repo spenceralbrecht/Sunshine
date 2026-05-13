@@ -3,6 +3,11 @@
  * @brief Definitions for display capture on macOS.
  */
 // local includes
+#include <chrono>
+#include <mutex>
+#include <optional>
+#include <vector>
+
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -21,6 +26,21 @@ namespace fs = std::filesystem;
 namespace platf {
   using namespace std::literals;
 
+  namespace {
+    constexpr auto capture_poll_timeout = 250ms;
+    constexpr auto dummy_capture_timeout = 5s;
+
+    std::optional<std::vector<CGDirectDisplayID>> active_display_ids() {
+      CGDirectDisplayID displays[kMaxDisplays];
+      uint32_t count = 0;
+      if (CGGetActiveDisplayList(kMaxDisplays, displays, &count) != kCGErrorSuccess) {
+        return std::nullopt;
+      }
+
+      return std::vector<CGDirectDisplayID> {displays, displays + count};
+    }
+  }  // namespace
+
   struct av_display_t: public display_t {
     AVVideo *av_capture {};
     CGDirectDisplayID display_id {};
@@ -30,7 +50,9 @@ namespace platf {
     }
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
-      auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+      auto push_callback_mutex = std::make_shared<std::mutex>();
+
+      auto capture_session = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
         auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
 
@@ -59,17 +81,34 @@ namespace platf {
 
         old_data_retainer = nullptr;
 
-        if (!push_captured_image_cb(std::move(img_out), true)) {
-          // got interrupt signal
-          // returning false here stops capture backend
-          return false;
+        {
+          std::scoped_lock lock {*push_callback_mutex};
+          if (!push_captured_image_cb(std::move(img_out), true)) {
+            // got interrupt signal
+            // returning false here stops capture backend
+            return false;
+          }
         }
 
         return true;
       }];
+      if (!capture_session.signal) {
+        return capture_e::error;
+      }
 
-      // FIXME: We should time out if an image isn't returned for a while
-      dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
+      // Poll for shutdown/reinit so the capture thread can stop even if the
+      // capture backend never delivers another frame after disconnect.
+      while (dispatch_semaphore_wait(capture_session.signal, dispatch_time(DISPATCH_TIME_NOW, std::chrono::duration_cast<std::chrono::nanoseconds>(capture_poll_timeout).count())) != 0) {
+        bool should_cancel = false;
+        {
+          std::scoped_lock lock {*push_callback_mutex};
+          should_cancel = !push_captured_image_cb(nullptr, false);
+        }
+
+        if (should_cancel) {
+          [av_capture cancelCapture:capture_session];
+        }
+      }
 
       return capture_e::ok;
     }
@@ -103,7 +142,7 @@ namespace platf {
         return 1;
       }
 
-      auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+      auto capture_session = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
         auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
 
@@ -129,8 +168,14 @@ namespace platf {
         // returning false here stops capture backend
         return false;
       }];
+      if (!capture_session.signal) {
+        return 1;
+      }
 
-      dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
+      if (dispatch_semaphore_wait(capture_session.signal, dispatch_time(DISPATCH_TIME_NOW, std::chrono::duration_cast<std::chrono::nanoseconds>(dummy_capture_timeout).count())) != 0) {
+        [av_capture cancelCapture:capture_session];
+        return 1;
+      }
 
       return 0;
     }
@@ -212,7 +257,22 @@ namespace platf {
    * @return `true` if a change has occurred or if it is unknown whether a change occurred.
    */
   bool needs_encoder_reenumeration() {
-    // We don't track GPU state, so we will always reenumerate. Fortunately, it is fast on macOS.
-    return true;
+    static std::mutex reenumeration_state_lock;
+    auto lg = std::lock_guard(reenumeration_state_lock);
+
+    auto current_display_ids = active_display_ids();
+    if (!current_display_ids) {
+      BOOST_LOG(error) << "Failed to enumerate displays for encoder reenumeration"sv;
+      return true;
+    }
+
+    static auto last_display_ids = *current_display_ids;
+    if (*current_display_ids != last_display_ids) {
+      BOOST_LOG(info) << "Encoder reenumeration is required"sv;
+      last_display_ids = *current_display_ids;
+      return true;
+    }
+
+    return false;
   }
 }  // namespace platf

@@ -184,8 +184,14 @@ namespace input {
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;
     platf::feedback_queue_t feedback_queue;
 
-    std::list<std::vector<uint8_t>> input_queue;
+    struct queued_input_t {
+      std::vector<uint8_t> data;
+      std::chrono::steady_clock::time_point enqueued_at;
+    };
+
+    std::list<queued_input_t> input_queue;
     std::mutex input_queue_lock;
+    bool input_queue_drain_scheduled {};
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;
 
@@ -1479,95 +1485,110 @@ namespace input {
    * @param input The input context pointer.
    */
   void passthrough_next_message(std::shared_ptr<input_t> input) {
-    // 'entry' backs the 'payload' pointer, so they must remain in scope together
-    std::vector<uint8_t> entry;
-    PNV_INPUT_HEADER payload;
+    while (true) {
+      // 'entry' backs the 'payload' pointer, so they must remain in scope together
+      std::vector<uint8_t> entry;
+      std::chrono::steady_clock::time_point enqueued_at;
+      std::size_t queued_after_pop {};
+      PNV_INPUT_HEADER payload;
 
-    // Lock the input queue while batching, but release it before sending
-    // the input to the OS. This avoids potentially lengthy lock contention
-    // in the control stream thread while input is being processed by the OS.
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
+      // Lock the input queue while batching, but release it before sending
+      // the input to the OS. This avoids potentially lengthy lock contention
+      // in the control stream thread while input is being processed by the OS.
+      {
+        std::lock_guard<std::mutex> lg(input->input_queue_lock);
 
-      // If all entries have already been processed, nothing to do
-      if (input->input_queue.empty()) {
-        return;
-      }
+        // If all entries have already been processed, allow the next producer
+        // to schedule another drain task.
+        if (input->input_queue.empty()) {
+          input->input_queue_drain_scheduled = false;
+          return;
+        }
 
-      // Pop off the first entry, which we will send
-      entry = input->input_queue.front();
-      payload = (PNV_INPUT_HEADER) entry.data();
-      input->input_queue.pop_front();
+        // Pop off the first entry, which we will send
+        entry = std::move(input->input_queue.front().data);
+        enqueued_at = input->input_queue.front().enqueued_at;
+        payload = (PNV_INPUT_HEADER) entry.data();
+        input->input_queue.pop_front();
+        queued_after_pop = input->input_queue.size();
 
-      // Try to batch with remaining items on the queue
-      auto i = input->input_queue.begin();
-      while (i != input->input_queue.end()) {
-        auto batchable_entry = *i;
-        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
+        // Try to batch with remaining items on the queue
+        auto i = input->input_queue.begin();
+        while (i != input->input_queue.end()) {
+          auto batchable_payload = (PNV_INPUT_HEADER) i->data.data();
 
-        auto batch_result = batch(payload, batchable_payload);
-        if (batch_result == batch_result_e::terminate_batch) {
-          // Stop batching
-          break;
-        } else if (batch_result == batch_result_e::batched) {
-          // Erase this entry since it was batched
-          i = input->input_queue.erase(i);
-        } else {
-          // We couldn't batch this entry, but try to batch later entries.
-          i++;
+          auto batch_result = batch(payload, batchable_payload);
+          if (batch_result == batch_result_e::terminate_batch) {
+            // Stop batching
+            break;
+          } else if (batch_result == batch_result_e::batched) {
+            // Erase this entry since it was batched
+            i = input->input_queue.erase(i);
+          } else {
+            // We couldn't batch this entry, but try to batch later entries.
+            i++;
+          }
         }
       }
-    }
 
-    // Print the final input packet
-    input::print((void *) payload);
+      const auto queued_for = std::chrono::steady_clock::now() - enqueued_at;
+      if (queued_for > 50ms || queued_after_pop > 20) {
+        BOOST_LOG(warning) << "Input queue delay: "
+                           << std::chrono::duration_cast<std::chrono::milliseconds>(queued_for).count()
+                           << "ms, queued_after_pop=" << queued_after_pop
+                           << ", magic=0x" << util::hex(util::endian::little(payload->magic)).to_string_view();
+      }
 
-    // Send the batched input to the OS
-    switch (util::endian::little(payload->magic)) {
-      case MOUSE_MOVE_REL_MAGIC_GEN5:
-        passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET) payload);
-        break;
-      case MOUSE_MOVE_ABS_MAGIC:
-        passthrough(input, (PNV_ABS_MOUSE_MOVE_PACKET) payload);
-        break;
-      case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
-      case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
-        passthrough(input, (PNV_MOUSE_BUTTON_PACKET) payload);
-        break;
-      case SCROLL_MAGIC_GEN5:
-        passthrough(input, (PNV_SCROLL_PACKET) payload);
-        break;
-      case SS_HSCROLL_MAGIC:
-        passthrough(input, (PSS_HSCROLL_PACKET) payload);
-        break;
-      case KEY_DOWN_EVENT_MAGIC:
-      case KEY_UP_EVENT_MAGIC:
-        passthrough(input, (PNV_KEYBOARD_PACKET) payload);
-        break;
-      case UTF8_TEXT_EVENT_MAGIC:
-        passthrough((PNV_UNICODE_PACKET) payload);
-        break;
-      case MULTI_CONTROLLER_MAGIC_GEN5:
-        passthrough(input, (PNV_MULTI_CONTROLLER_PACKET) payload);
-        break;
-      case SS_TOUCH_MAGIC:
-        passthrough(input, (PSS_TOUCH_PACKET) payload);
-        break;
-      case SS_PEN_MAGIC:
-        passthrough(input, (PSS_PEN_PACKET) payload);
-        break;
-      case SS_CONTROLLER_ARRIVAL_MAGIC:
-        passthrough(input, (PSS_CONTROLLER_ARRIVAL_PACKET) payload);
-        break;
-      case SS_CONTROLLER_TOUCH_MAGIC:
-        passthrough(input, (PSS_CONTROLLER_TOUCH_PACKET) payload);
-        break;
-      case SS_CONTROLLER_MOTION_MAGIC:
-        passthrough(input, (PSS_CONTROLLER_MOTION_PACKET) payload);
-        break;
-      case SS_CONTROLLER_BATTERY_MAGIC:
-        passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
-        break;
+      // Print the final input packet
+      input::print((void *) payload);
+
+      // Send the batched input to the OS
+      switch (util::endian::little(payload->magic)) {
+        case MOUSE_MOVE_REL_MAGIC_GEN5:
+          passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET) payload);
+          break;
+        case MOUSE_MOVE_ABS_MAGIC:
+          passthrough(input, (PNV_ABS_MOUSE_MOVE_PACKET) payload);
+          break;
+        case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
+        case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
+          passthrough(input, (PNV_MOUSE_BUTTON_PACKET) payload);
+          break;
+        case SCROLL_MAGIC_GEN5:
+          passthrough(input, (PNV_SCROLL_PACKET) payload);
+          break;
+        case SS_HSCROLL_MAGIC:
+          passthrough(input, (PSS_HSCROLL_PACKET) payload);
+          break;
+        case KEY_DOWN_EVENT_MAGIC:
+        case KEY_UP_EVENT_MAGIC:
+          passthrough(input, (PNV_KEYBOARD_PACKET) payload);
+          break;
+        case UTF8_TEXT_EVENT_MAGIC:
+          passthrough((PNV_UNICODE_PACKET) payload);
+          break;
+        case MULTI_CONTROLLER_MAGIC_GEN5:
+          passthrough(input, (PNV_MULTI_CONTROLLER_PACKET) payload);
+          break;
+        case SS_TOUCH_MAGIC:
+          passthrough(input, (PSS_TOUCH_PACKET) payload);
+          break;
+        case SS_PEN_MAGIC:
+          passthrough(input, (PSS_PEN_PACKET) payload);
+          break;
+        case SS_CONTROLLER_ARRIVAL_MAGIC:
+          passthrough(input, (PSS_CONTROLLER_ARRIVAL_PACKET) payload);
+          break;
+        case SS_CONTROLLER_TOUCH_MAGIC:
+          passthrough(input, (PSS_CONTROLLER_TOUCH_PACKET) payload);
+          break;
+        case SS_CONTROLLER_MOTION_MAGIC:
+          passthrough(input, (PSS_CONTROLLER_MOTION_PACKET) payload);
+          break;
+        case SS_CONTROLLER_BATTERY_MAGIC:
+          passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
+          break;
+      }
     }
   }
 
@@ -1577,11 +1598,20 @@ namespace input {
    * @param input_data The input message.
    */
   void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data) {
+    bool should_schedule {};
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
-      input->input_queue.push_back(std::move(input_data));
+      input->input_queue.push_back({std::move(input_data), std::chrono::steady_clock::now()});
+
+      if (!input->input_queue_drain_scheduled) {
+        input->input_queue_drain_scheduled = true;
+        should_schedule = true;
+      }
     }
-    task_pool.push(passthrough_next_message, input);
+
+    if (should_schedule) {
+      task_pool.push(passthrough_next_message, input);
+    }
   }
 
   void reset(std::shared_ptr<input_t> &input) {

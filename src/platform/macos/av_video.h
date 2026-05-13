@@ -8,10 +8,10 @@
 #import <AppKit/AppKit.h>
 #import <AVFoundation/AVFoundation.h>
 
-struct CaptureSession {
-  AVCaptureVideoDataOutput *output;
-  NSCondition *captureStopped;
-};
+typedef struct CaptureSession {
+  AVCaptureConnection *connection;
+  dispatch_semaphore_t signal;
+} CaptureSession;
 
 @interface AVVideo: NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 
@@ -36,6 +36,7 @@ typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
 - (id)initWithDisplay:(CGDirectDisplayID)displayID frameRate:(int)frameRate;
 
 - (void)setFrameWidth:(int)frameWidth frameHeight:(int)frameHeight;
-- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback;
+- (CaptureSession)capture:(FrameCallbackBlock)frameCallback;
+- (void)cancelCapture:(CaptureSession)captureSession;
 
 @end

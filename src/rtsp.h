@@ -6,6 +6,7 @@
 
 // standard includes
 #include <atomic>
+#include <string_view>
 
 // local includes
 #include "crypto.h"
@@ -63,4 +64,21 @@ namespace rtsp_stream {
    * @brief Runs the RTSP server loop.
    */
   void start();
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Returns true when a new session should replace an existing session.
+   */
+  bool should_replace_stream_session(std::string_view existing_unique_id, std::string_view incoming_unique_id);
+
+  /**
+   * @brief Returns the pending RTSP launch session ID, if any.
+   */
+  std::optional<uint32_t> test_pending_launch_session_id();
+
+  /**
+   * @brief Clears any pending RTSP launch session.
+   */
+  void test_clear_pending_launch_session();
+#endif
 }  // namespace rtsp_stream

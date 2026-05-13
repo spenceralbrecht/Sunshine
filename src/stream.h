@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <string_view>
 #include <utility>
 
 // lib includes
@@ -51,5 +52,6 @@ namespace stream {
     void stop(session_t &session);
     void join(session_t &session);
     state_e state(session_t &session);
+    std::string_view unique_id(session_t &session);
   }  // namespace session
 }  // namespace stream

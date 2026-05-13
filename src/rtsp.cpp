@@ -40,6 +40,10 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace rtsp_stream {
+  bool should_replace_stream_session(std::string_view existing_unique_id, std::string_view incoming_unique_id) {
+    return !incoming_unique_id.empty() && existing_unique_id == incoming_unique_id;
+  }
+
   void free_msg(PRTSP_MESSAGE msg) {
     freeMessage(msg);
 
@@ -490,9 +494,13 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     void session_raise(std::shared_ptr<launch_session_t> launch_session) {
-      // If a launch event is still pending, don't overwrite it.
-      if (launch_event.view(0s)) {
-        return;
+      raised_timer.cancel();
+
+      auto replaced_launch_session = launch_event.pop(0s);
+      if (replaced_launch_session) {
+        BOOST_LOG(debug) << "Replacing pending RTSP session "sv
+                         << replaced_launch_session->unique_id
+                         << " with "sv << launch_session->unique_id;
       }
 
       // Raise the new launch session to prepare for the RTSP handshake
@@ -537,6 +545,22 @@ namespace rtsp_stream {
       return _session_slots->size();
     }
 
+#ifdef SUNSHINE_TESTS
+    std::optional<uint32_t> pending_launch_session_id() {
+      auto launch_session = launch_event.view(0s);
+      if (!launch_session) {
+        return std::nullopt;
+      }
+
+      return launch_session->id;
+    }
+
+    void clear_pending_launch_session() {
+      raised_timer.cancel();
+      launch_event.pop(0s);
+    }
+#endif
+
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;
 
     /**
@@ -547,18 +571,51 @@ namespace rtsp_stream {
      * @examples_end
      */
     void clear(bool all = true) {
-      auto lg = _session_slots.lock();
+      std::vector<std::shared_ptr<stream::session_t>> sessions_to_join;
+      {
+        auto lg = _session_slots.lock();
 
-      for (auto i = _session_slots->begin(); i != _session_slots->end();) {
-        auto &slot = *(*i);
-        if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
-          stream::session::stop(slot);
-          stream::session::join(slot);
-
-          i = _session_slots->erase(i);
-        } else {
-          i++;
+        for (auto i = _session_slots->begin(); i != _session_slots->end();) {
+          auto session = *i;
+          if (all || stream::session::state(*session) == stream::session::state_e::STOPPING) {
+            stream::session::stop(*session);
+            sessions_to_join.emplace_back(std::move(session));
+            i = _session_slots->erase(i);
+          } else {
+            ++i;
+          }
         }
+      }
+
+      for (auto &session : sessions_to_join) {
+        stream::session::join(*session);
+      }
+    }
+
+    /**
+     * @brief Stops active sessions owned by the same Moonlight client identity.
+     * @param unique_id The incoming client's persisted unique ID.
+     */
+    void stop_sessions_for_unique_id(std::string_view unique_id) {
+      std::vector<std::shared_ptr<stream::session_t>> sessions_to_join;
+      {
+        auto lg = _session_slots.lock();
+
+        for (auto i = _session_slots->begin(); i != _session_slots->end();) {
+          auto session = *i;
+          if (should_replace_stream_session(stream::session::unique_id(*session), unique_id)) {
+            BOOST_LOG(info) << "Stopping existing streaming session for client "sv << unique_id << " before replacement"sv;
+            stream::session::stop(*session);
+            sessions_to_join.emplace_back(std::move(session));
+            i = _session_slots->erase(i);
+          } else {
+            ++i;
+          }
+        }
+      }
+
+      for (auto &session : sessions_to_join) {
+        stream::session::join(*session);
       }
     }
 
@@ -635,6 +692,16 @@ namespace rtsp_stream {
   void terminate_sessions() {
     server.clear(true);
   }
+
+#ifdef SUNSHINE_TESTS
+  std::optional<uint32_t> test_pending_launch_session_id() {
+    return server.pending_launch_session_id();
+  }
+
+  void test_clear_pending_launch_session() {
+    server.clear_pending_launch_session();
+  }
+#endif
 
   int send(tcp::socket &sock, const std::string_view &sv) {
     std::size_t bytes_send = 0;
@@ -941,6 +1008,9 @@ namespace rtsp_stream {
     args.try_emplace("x-nv-video[0].encoderCscMode"sv, "0"sv);
     args.try_emplace("x-nv-vqos[0].bitStreamFormat"sv, "0"sv);
     args.try_emplace("x-nv-video[0].dynamicRangeMode"sv, "0"sv);
+    args.try_emplace("x-nv-audio.surround.numChannels"sv, "0"sv);
+    args.try_emplace("x-nv-audio.surround.channelMask"sv, "0"sv);
+    args.try_emplace("x-nv-audio.surround.AudioQuality"sv, "0"sv);
     args.try_emplace("x-nv-aqos.packetDuration"sv, "5"sv);
     args.try_emplace("x-nv-general.useReliableUdp"sv, "1"sv);
     args.try_emplace("x-nv-vqos[0].fec.minRequiredFecPackets"sv, "0"sv);
@@ -957,13 +1027,15 @@ namespace rtsp_stream {
 
     std::int64_t configuredBitrateKbps;
     config.audio.flags[audio::config_t::HOST_AUDIO] = session.host_audio;
+    config.audio.channels = 0;
+    config.audio.mask = 0;
+    config.audio.packetDuration = 0;
+    config.audio.flags[audio::config_t::HIGH_QUALITY] = false;
     try {
       config.audio.channels = util::from_view(args.at("x-nv-audio.surround.numChannels"sv));
       config.audio.mask = util::from_view(args.at("x-nv-audio.surround.channelMask"sv));
       config.audio.packetDuration = util::from_view(args.at("x-nv-aqos.packetDuration"sv));
-
-      config.audio.flags[audio::config_t::HIGH_QUALITY] =
-        util::from_view(args.at("x-nv-audio.surround.AudioQuality"sv));
+      config.audio.flags[audio::config_t::HIGH_QUALITY] = util::from_view(args.at("x-nv-audio.surround.AudioQuality"sv));
 
       config.controlProtocolType = util::from_view(args.at("x-nv-general.useReliableUdp"sv));
       config.packetsize = util::from_view(args.at("x-nv-video[0].packetSize"sv));
@@ -994,6 +1066,10 @@ namespace rtsp_stream {
     } catch (std::out_of_range &) {
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return;
+    }
+
+    if (config.audio.channels <= 0) {
+      BOOST_LOG(info) << "Client omitted audio negotiation; starting silent session"sv;
     }
 
     // When using stereo audio, the audio quality is (strangely) indicated by whether the Host field
@@ -1080,6 +1156,8 @@ namespace rtsp_stream {
       respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});
       return;
     }
+
+    server->stop_sessions_for_unique_id(session.unique_id);
 
     auto stream_session = stream::session::alloc(config, session);
     server->insert(stream_session);

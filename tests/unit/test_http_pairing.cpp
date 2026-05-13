@@ -265,3 +265,15 @@ TEST(PairingTest, OutOfOrderCalls) {
   getservercert(sess, tree, "test");
   ASSERT_FALSE(tree.get<int>("root.paired") == 1);
 }
+
+TEST(PairingTest, PendingPairSessionsAreClearedBeforeShutdown) {
+  pair_session_t sess {};
+  sess.client.uniqueID = "pending-pair-session";
+  sess.async_insert_pin.response = std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> {};
+
+  test_add_pending_pair_session(std::move(sess));
+  ASSERT_EQ(test_pending_pair_session_count(), 1U);
+
+  test_clear_pending_pair_sessions();
+  EXPECT_EQ(test_pending_pair_session_count(), 0U);
+}

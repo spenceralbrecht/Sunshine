@@ -53,3 +53,10 @@ TEST(HostnameTests, TestAsioEquality) {
   // These should be equivalent on all platforms for ASCII hostnames
   ASSERT_EQ(platf::get_host_name(), boost::asio::ip::host_name());
 }
+
+#ifdef __APPLE__
+TEST(PlatformStateTests, EncoderReenumerationDoesNotFlapWithoutDisplayChanges) {
+  (void) platf::needs_encoder_reenumeration();
+  EXPECT_FALSE(platf::needs_encoder_reenumeration());
+}
+#endif

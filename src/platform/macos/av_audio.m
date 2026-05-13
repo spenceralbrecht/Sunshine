@@ -54,6 +54,26 @@
 }
 
 - (void)dealloc {
+  AVCaptureSession *captureSession = self.audioCaptureSession;
+  if (captureSession) {
+    if ([captureSession isRunning]) {
+      [captureSession stopRunning];
+    }
+
+    NSArray *outputs = [[captureSession.outputs copy] autorelease];
+    for (AVCaptureOutput *output in outputs) {
+      [captureSession removeOutput:output];
+    }
+
+    NSArray *inputs = [[captureSession.inputs copy] autorelease];
+    for (AVCaptureInput *input in inputs) {
+      [captureSession removeInput:input];
+    }
+
+    [captureSession release];
+    self.audioCaptureSession = nil;
+  }
+
   // make sure we don't process any further samples
   self.audioConnection = nil;
   // make sure nothing gets stuck on this signal
@@ -67,15 +87,19 @@
   self.audioCaptureSession = [[AVCaptureSession alloc] init];
 
   NSError *error;
-  AVCaptureDeviceInput *audioInput = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
+  AVCaptureDeviceInput *audioInput = [[AVCaptureDeviceInput alloc] initWithDevice:device error:&error];
   if (audioInput == nil) {
+    [self.audioCaptureSession release];
+    self.audioCaptureSession = nil;
     return -1;
   }
 
   if ([self.audioCaptureSession canAddInput:audioInput]) {
     [self.audioCaptureSession addInput:audioInput];
   } else {
-    [audioInput dealloc];
+    [audioInput release];
+    [self.audioCaptureSession release];
+    self.audioCaptureSession = nil;
     return -1;
   }
 
@@ -100,6 +124,8 @@
   } else {
     [audioInput release];
     [audioOutput release];
+    [self.audioCaptureSession release];
+    self.audioCaptureSession = nil;
     return -1;
   }
 

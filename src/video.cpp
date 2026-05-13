@@ -2155,21 +2155,25 @@ namespace video {
     auto ec = platf::capture_e::ok;
     while (encode_session_ctx_queue.running()) {
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
-        while (encode_session_ctx_queue.peek()) {
-          auto encode_session_ctx = encode_session_ctx_queue.pop();
-          if (!encode_session_ctx) {
-            return false;
+        const bool has_captured_frame = frame_captured && img;
+
+        if (has_captured_frame) {
+          while (encode_session_ctx_queue.peek()) {
+            auto encode_session_ctx = encode_session_ctx_queue.pop();
+            if (!encode_session_ctx) {
+              return false;
+            }
+
+            synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*encode_session_ctx)));
+
+            auto encode_session = make_synced_session(disp.get(), encoder, *img, *synced_session_ctxs.back());
+            if (!encode_session) {
+              ec = platf::capture_e::error;
+              return false;
+            }
+
+            synced_sessions.emplace_back(std::move(*encode_session));
           }
-
-          synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*encode_session_ctx)));
-
-          auto encode_session = make_synced_session(disp.get(), encoder, *img, *synced_session_ctxs.back());
-          if (!encode_session) {
-            ec = platf::capture_e::error;
-            return false;
-          }
-
-          synced_sessions.emplace_back(std::move(*encode_session));
         }
 
         KITTY_WHILE_LOOP(auto pos = std::begin(synced_sessions), pos != std::end(synced_sessions), {
@@ -2195,17 +2199,21 @@ namespace video {
             ctx->idr_events->pop();
           }
 
-          if (frame_captured && pos->session->convert(*img)) {
+          // The macOS capture path can emit synthetic no-frame ticks while it
+          // waits for the next real frame. Use them only for lifecycle events.
+          if (!has_captured_frame) {
+            ++pos;
+            continue;
+          }
+
+          if (pos->session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             ctx->shutdown_event->raise(true);
 
             continue;
           }
 
-          std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
-          if (img) {
-            frame_timestamp = img->frame_timestamp;
-          }
+          std::optional<std::chrono::steady_clock::time_point> frame_timestamp = img->frame_timestamp;
 
           if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
