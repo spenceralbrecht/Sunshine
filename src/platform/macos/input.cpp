@@ -455,19 +455,38 @@ const KeyCodeMap kKeyCodesMap[] = {
   }
 
   void scroll(input_t &input, const int high_res_distance) {
-    CGEventRef upEvent = CGEventCreateScrollWheelEvent(
-      nullptr,
-      kCGScrollEventUnitLine,
-      2,
-      high_res_distance > 0 ? 1 : -1,
+    const auto macos_input = static_cast<macos_input_t *>(input.get());
+    CGEventRef scroll_event = CGEventCreateScrollWheelEvent(
+      macos_input->source,
+      kCGScrollEventUnitPixel,
+      1,
       high_res_distance
     );
-    CGEventPost(kCGHIDEventTap, upEvent);
-    CFRelease(upEvent);
+    if (scroll_event == nullptr) {
+      BOOST_LOG(warning) << "Failed to create macOS scroll event"sv;
+      return;
+    }
+
+    CGEventPost(kCGHIDEventTap, scroll_event);
+    CFRelease(scroll_event);
   }
 
   void hscroll(input_t &input, int high_res_distance) {
-    // Unimplemented
+    const auto macos_input = static_cast<macos_input_t *>(input.get());
+    CGEventRef scroll_event = CGEventCreateScrollWheelEvent(
+      macos_input->source,
+      kCGScrollEventUnitPixel,
+      2,
+      0,
+      high_res_distance
+    );
+    if (scroll_event == nullptr) {
+      BOOST_LOG(warning) << "Failed to create macOS horizontal scroll event"sv;
+      return;
+    }
+
+    CGEventPost(kCGHIDEventTap, scroll_event);
+    CFRelease(scroll_event);
   }
 
   /**
