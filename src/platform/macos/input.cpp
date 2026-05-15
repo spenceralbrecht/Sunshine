@@ -25,6 +25,10 @@
  * @todo Make this configurable.
  */
 constexpr std::chrono::milliseconds MULTICLICK_DELAY_MS(500);
+constexpr int HIGH_RES_WHEEL_DELTA = 120;
+constexpr int MACOS_SCROLL_PIXELS_PER_WHEEL_DELTA = 90;
+constexpr int MACOS_MIN_SCROLL_PIXELS = 8;
+constexpr int MACOS_MAX_SCROLL_PIXELS = 240;
 
 namespace platf {
   using namespace std::literals;
@@ -44,6 +48,24 @@ namespace platf {
     bool mouse_down[3] {};  // mouse button status
     std::chrono::steady_clock::steady_clock::time_point last_mouse_event[3][2];  // timestamp of last mouse events
   };
+
+  int high_res_scroll_to_pixels(int high_res_distance) {
+    if (high_res_distance == 0) {
+      return 0;
+    }
+
+    const int direction = high_res_distance < 0 ? -1 : 1;
+    const int magnitude = high_res_distance < 0 ? -high_res_distance : high_res_distance;
+    int pixels = (magnitude * MACOS_SCROLL_PIXELS_PER_WHEEL_DELTA + HIGH_RES_WHEEL_DELTA - 1) / HIGH_RES_WHEEL_DELTA;
+
+    if (pixels < MACOS_MIN_SCROLL_PIXELS) {
+      pixels = MACOS_MIN_SCROLL_PIXELS;
+    } else if (pixels > MACOS_MAX_SCROLL_PIXELS) {
+      pixels = MACOS_MAX_SCROLL_PIXELS;
+    }
+
+    return pixels * direction;
+  }
 
   // A struct to hold a Windows keycode to Mac virtual keycode mapping.
   struct KeyCodeMap {
@@ -456,11 +478,16 @@ const KeyCodeMap kKeyCodesMap[] = {
 
   void scroll(input_t &input, const int high_res_distance) {
     const auto macos_input = static_cast<macos_input_t *>(input.get());
+    const int scroll_pixels = high_res_scroll_to_pixels(high_res_distance);
+    if (scroll_pixels == 0) {
+      return;
+    }
+
     CGEventRef scroll_event = CGEventCreateScrollWheelEvent(
       macos_input->source,
       kCGScrollEventUnitPixel,
       1,
-      high_res_distance
+      scroll_pixels
     );
     if (scroll_event == nullptr) {
       BOOST_LOG(warning) << "Failed to create macOS scroll event"sv;
@@ -473,12 +500,17 @@ const KeyCodeMap kKeyCodesMap[] = {
 
   void hscroll(input_t &input, int high_res_distance) {
     const auto macos_input = static_cast<macos_input_t *>(input.get());
+    const int scroll_pixels = high_res_scroll_to_pixels(high_res_distance);
+    if (scroll_pixels == 0) {
+      return;
+    }
+
     CGEventRef scroll_event = CGEventCreateScrollWheelEvent(
       macos_input->source,
       kCGScrollEventUnitPixel,
       2,
       0,
-      high_res_distance
+      scroll_pixels
     );
     if (scroll_event == nullptr) {
       BOOST_LOG(warning) << "Failed to create macOS horizontal scroll event"sv;
