@@ -60,6 +60,8 @@
 
   AVCaptureScreenInput *screenInput = [[AVCaptureScreenInput alloc] initWithDisplayID:self.displayID];
   [screenInput setMinFrameDuration:self.minFrameDuration];
+  [screenInput setCapturesCursor:NO];
+  [screenInput setCapturesMouseClicks:NO];
 
   if ([self.session canAddInput:screenInput]) {
     [self.session addInput:screenInput];
