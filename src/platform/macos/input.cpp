@@ -428,6 +428,12 @@ const KeyCodeMap kKeyCodesMap[] = {
         mac_button = kCGMouseButtonRight;
         event = release ? kCGEventRightMouseUp : kCGEventRightMouseDown;
         break;
+      case 4:
+      case 5:
+        mac_button = kCGMouseButtonLeft;
+        event = release ? kCGEventLeftMouseUp : kCGEventLeftMouseDown;
+        BOOST_LOG(debug) << "Mapping macOS auxiliary mouse button "sv << button << " to left click"sv;
+        break;
       default:
         BOOST_LOG(warning) << "Unsupported mouse button for MacOS: "sv << button;
         return;
