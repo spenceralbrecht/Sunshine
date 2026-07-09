@@ -192,6 +192,10 @@ namespace input {
     std::list<queued_input_t> input_queue;
     std::mutex input_queue_lock;
     bool input_queue_drain_scheduled {};
+    std::chrono::steady_clock::time_point last_input_latency_warning {};
+    std::chrono::steady_clock::time_point last_input_depth_diagnostic {};
+    std::size_t suppressed_input_latency_warnings {};
+    std::size_t suppressed_input_depth_diagnostics {};
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;
 
@@ -1531,12 +1535,44 @@ namespace input {
         }
       }
 
-      const auto queued_for = std::chrono::steady_clock::now() - enqueued_at;
-      if (queued_for > 50ms || queued_after_pop > 20) {
-        BOOST_LOG(warning) << "Input queue delay: "
+      const auto now = std::chrono::steady_clock::now();
+      const auto queued_for = now - enqueued_at;
+      if (queued_for > 50ms) {
+        constexpr auto warning_interval = 1s;
+        if (input->last_input_latency_warning == std::chrono::steady_clock::time_point {} ||
+            now - input->last_input_latency_warning >= warning_interval) {
+          const auto suppressed = input->suppressed_input_latency_warnings;
+          input->last_input_latency_warning = now;
+          input->suppressed_input_latency_warnings = 0;
+
+          BOOST_LOG(warning) << "Input queue delay: "
+                             << std::chrono::duration_cast<std::chrono::milliseconds>(queued_for).count()
+                             << "ms, queued_after_pop=" << queued_after_pop
+                             << ", suppressed_since_last=" << suppressed
+                             << ", magic=0x" << util::hex(util::endian::little(payload->magic)).to_string_view();
+        } else {
+          ++input->suppressed_input_latency_warnings;
+        }
+      } else if (queued_after_pop > 20) {
+        // A transient queue-depth spike is common when a client sends a burst of
+        // keyboard events. It is only actionable when packets are also delayed,
+        // so keep this as a sparse debug diagnostic rather than a warning for
+        // every packet in the burst.
+        constexpr auto diagnostic_interval = 10s;
+        if (input->last_input_depth_diagnostic == std::chrono::steady_clock::time_point {} ||
+            now - input->last_input_depth_diagnostic >= diagnostic_interval) {
+          const auto suppressed = input->suppressed_input_depth_diagnostics;
+          input->last_input_depth_diagnostic = now;
+          input->suppressed_input_depth_diagnostics = 0;
+
+          BOOST_LOG(debug) << "Input queue depth: queued_after_pop=" << queued_after_pop
+                           << ", queued_for="
                            << std::chrono::duration_cast<std::chrono::milliseconds>(queued_for).count()
-                           << "ms, queued_after_pop=" << queued_after_pop
+                           << "ms, suppressed_since_last=" << suppressed
                            << ", magic=0x" << util::hex(util::endian::little(payload->magic)).to_string_view();
+        } else {
+          ++input->suppressed_input_depth_diagnostics;
+        }
       }
 
       // Print the final input packet
