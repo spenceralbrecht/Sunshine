@@ -1179,6 +1179,11 @@ namespace config {
 
     int_between_f(vars, "lan_encryption_mode", stream.lan_encryption_mode, {0, 2});
     int_between_f(vars, "wan_encryption_mode", stream.wan_encryption_mode, {0, 2});
+    if (stream.lan_encryption_mode == ENCRYPTION_MODE_NEVER) {
+      BOOST_LOG(warning) << "LAN stream encryption is disabled. Sunshine classifies RFC1918, "
+                         << "link-local, and CGNAT ranges including 100.64.0.0/10 as LAN; "
+                         << "use this only on trusted or firewall-isolated networks.";
+    }
 
     path_f(vars, "file_apps", stream.file_apps);
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});

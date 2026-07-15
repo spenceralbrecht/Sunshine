@@ -11,6 +11,14 @@ applies to `amfenc` and `libx264`.
 
 Enabling *Fast Sync* in Nvidia settings may help reduce latency.
 
+## macOS Remote Streaming
+
+For macOS hosts that are usually reached through Tailscale, see
+[macOS Remote Streaming Notes](macos_remote_streaming.md).
+
+For the longer-term macOS capture backend work, see
+[macOS ScreenCaptureKit Capture Plan](macos_screencapturekit_capture_plan.md).
+
 <div class="section_buttons">
 
 | Previous            |          Next |
