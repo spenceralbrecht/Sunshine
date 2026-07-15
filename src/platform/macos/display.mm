@@ -2,12 +2,16 @@
  * @file src/platform/macos/display.mm
  * @brief Definitions for display capture on macOS.
  */
-// local includes
+// standard includes
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
 
+// local includes
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -29,6 +33,58 @@ namespace platf {
   namespace {
     constexpr auto capture_poll_timeout = 250ms;
     constexpr auto dummy_capture_timeout = 5s;
+    constexpr auto capture_stats_log_interval = 30s;
+
+    struct capture_stats_t {
+      std::atomic<uint64_t> real_frames {0};
+      std::atomic<uint64_t> no_frame_ticks {0};
+      std::atomic<uint64_t> pull_interrupts {0};
+      std::atomic<uint64_t> push_interrupts {0};
+      std::mutex log_mutex;
+      std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+      uint64_t last_real_frames {};
+      uint64_t last_no_frame_ticks {};
+      uint64_t last_pull_interrupts {};
+      uint64_t last_push_interrupts {};
+    };
+
+    void maybe_log_capture_stats(const std::shared_ptr<capture_stats_t> &stats, bool force = false) {
+      auto now = std::chrono::steady_clock::now();
+      std::scoped_lock lock {stats->log_mutex};
+      if (!force && now - stats->last_log < capture_stats_log_interval) {
+        return;
+      }
+
+      auto elapsed = std::chrono::duration<double>(now - stats->last_log).count();
+      if (elapsed <= 0.0) {
+        elapsed = 1.0;
+      }
+
+      auto real_frames = stats->real_frames.load(std::memory_order_relaxed);
+      auto no_frame_ticks = stats->no_frame_ticks.load(std::memory_order_relaxed);
+      auto pull_interrupts = stats->pull_interrupts.load(std::memory_order_relaxed);
+      auto push_interrupts = stats->push_interrupts.load(std::memory_order_relaxed);
+
+      auto real_delta = real_frames - stats->last_real_frames;
+      auto no_frame_delta = no_frame_ticks - stats->last_no_frame_ticks;
+      auto pull_delta = pull_interrupts - stats->last_pull_interrupts;
+      auto push_delta = push_interrupts - stats->last_push_interrupts;
+
+      if (force && real_delta == 0 && no_frame_delta == 0 && pull_delta == 0 && push_delta == 0) {
+        return;
+      }
+
+      BOOST_LOG(info) << "macOS capture stats: real_frames="sv << real_delta
+                      << " ("sv << (real_delta / elapsed) << " fps), no_frame_ticks="sv << no_frame_delta
+                      << ", pull_interrupts="sv << pull_delta
+                      << ", push_interrupts="sv << push_delta;
+
+      stats->last_log = now;
+      stats->last_real_frames = real_frames;
+      stats->last_no_frame_ticks = no_frame_ticks;
+      stats->last_pull_interrupts = pull_interrupts;
+      stats->last_push_interrupts = push_interrupts;
+    }
 
     std::optional<std::vector<CGDirectDisplayID>> active_display_ids() {
       CGDirectDisplayID displays[kMaxDisplays];
@@ -50,6 +106,7 @@ namespace platf {
     }
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+      auto capture_stats = std::make_shared<capture_stats_t>();
       auto push_callback_mutex = std::make_shared<std::mutex>();
 
       auto capture_session = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
@@ -58,6 +115,8 @@ namespace platf {
 
         std::shared_ptr<img_t> img_out;
         if (!pull_free_image_cb(img_out)) {
+          capture_stats->pull_interrupts.fetch_add(1, std::memory_order_relaxed);
+          maybe_log_capture_stats(capture_stats, true);
           // got interrupt signal
           // returning false here stops capture backend
           return false;
@@ -84,11 +143,16 @@ namespace platf {
         {
           std::scoped_lock lock {*push_callback_mutex};
           if (!push_captured_image_cb(std::move(img_out), true)) {
+            capture_stats->push_interrupts.fetch_add(1, std::memory_order_relaxed);
+            maybe_log_capture_stats(capture_stats, true);
             // got interrupt signal
             // returning false here stops capture backend
             return false;
           }
         }
+
+        capture_stats->real_frames.fetch_add(1, std::memory_order_relaxed);
+        maybe_log_capture_stats(capture_stats);
 
         return true;
       }];
@@ -98,7 +162,14 @@ namespace platf {
 
       // Poll for shutdown/reinit so the capture thread can stop even if the
       // capture backend never delivers another frame after disconnect.
+      auto last_polled_real_frames = capture_stats->real_frames.load(std::memory_order_relaxed);
       while (dispatch_semaphore_wait(capture_session.signal, dispatch_time(DISPATCH_TIME_NOW, std::chrono::duration_cast<std::chrono::nanoseconds>(capture_poll_timeout).count())) != 0) {
+        auto real_frames = capture_stats->real_frames.load(std::memory_order_relaxed);
+        if (real_frames == last_polled_real_frames) {
+          capture_stats->no_frame_ticks.fetch_add(1, std::memory_order_relaxed);
+        }
+        last_polled_real_frames = real_frames;
+
         bool should_cancel = false;
         {
           std::scoped_lock lock {*push_callback_mutex};
@@ -106,9 +177,15 @@ namespace platf {
         }
 
         if (should_cancel) {
+          capture_stats->push_interrupts.fetch_add(1, std::memory_order_relaxed);
+          maybe_log_capture_stats(capture_stats, true);
           [av_capture cancelCapture:capture_session];
         }
+
+        maybe_log_capture_stats(capture_stats);
       }
+
+      maybe_log_capture_stats(capture_stats, true);
 
       return capture_e::ok;
     }
