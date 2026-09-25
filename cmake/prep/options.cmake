@@ -16,7 +16,13 @@ option(BUILD_WERROR "Enable -Werror flag." OFF)
 # if this option is set, the build will exit after configuring special package configuration files
 option(SUNSHINE_CONFIGURE_ONLY "Configure special files only, then exit." OFF)
 
-option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
+if(APPLE)
+    # Streaming callbacks can update AppKit menu objects from worker threads.
+    # Remote workstation builds must not depend on that optional UI path.
+    option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." OFF)
+else()
+    option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
+endif()
 
 option(SUNSHINE_SYSTEM_WAYLAND_PROTOCOLS "Use system installation of wayland-protocols rather than the submodule." OFF)
 
