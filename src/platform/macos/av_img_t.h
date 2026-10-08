@@ -52,6 +52,8 @@ namespace platf {
   struct av_img_t: img_t {
     std::shared_ptr<av_sample_buf_t> sample_buffer;
     std::shared_ptr<av_pixel_buf_t> pixel_buffer;
+
+    bool same_pixels(const img_t &other) const override;
   };
 
   struct temp_retain_av_img_t {
