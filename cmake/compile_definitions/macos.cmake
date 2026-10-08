@@ -60,8 +60,11 @@ set(PLATFORM_TARGET_FILES
         ${APPLE_PLIST_FILE})
 
 if(SUNSHINE_ENABLE_TRAY)
+    set(SUNSHINE_TRAY 1)
     list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
             ${COCOA})
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/third-party/tray/src/tray_darwin.m")
+else()
+    set(SUNSHINE_TRAY 0)
 endif()

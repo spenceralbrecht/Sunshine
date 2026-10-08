@@ -384,6 +384,11 @@ namespace platf {
 
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
 
+    // Unsupported capture backends always encode the frame.
+    virtual bool same_pixels(const img_t &other) const {
+      return false;
+    }
+
     virtual ~img_t() = default;
   };
 
