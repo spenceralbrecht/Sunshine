@@ -52,6 +52,7 @@ namespace mail {
   // Local mail
   MAIL(touch_port);
   MAIL(idr);
+  MAIL(cellular_idle);
   MAIL(invalidate_ref_frames);
   MAIL(gamepad_feedback);
   MAIL(hdr);

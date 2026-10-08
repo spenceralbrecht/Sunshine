@@ -15,6 +15,7 @@
 #include "src/platform/macos/av_video.h"
 #include "src/platform/macos/misc.h"
 #include "src/platform/macos/nv12_zero_device.h"
+#include "src/video_idle.h"
 
 // Avoid conflict between AVFoundation and libavutil both defining AVMediaType
 #define AVMediaType AVMediaType_FFmpeg
@@ -25,6 +26,58 @@ namespace fs = std::filesystem;
 
 namespace platf {
   using namespace std::literals;
+
+  bool av_img_t::same_pixels(const img_t &other) const {
+    auto previous = dynamic_cast<const av_img_t *>(&other);
+    if (!previous || !pixel_buffer || !previous->pixel_buffer) {
+      return false;
+    }
+    auto a = pixel_buffer->buf;
+    auto b = previous->pixel_buffer->buf;
+    auto format = CVPixelBufferGetPixelFormatType(a);
+    if (format != CVPixelBufferGetPixelFormatType(b) ||
+        CVPixelBufferGetWidth(a) != CVPixelBufferGetWidth(b) ||
+        CVPixelBufferGetHeight(a) != CVPixelBufferGetHeight(b)) {
+      return false;
+    }
+    if (CVPixelBufferLockBaseAddress(a, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+      return false;
+    }
+    if (CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+      CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly);
+      return false;
+    }
+    auto unlock = util::fail_guard([a, b] {
+      CVPixelBufferUnlockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
+      CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly);
+    });
+    if (format == kCVPixelFormatType_32BGRA && !CVPixelBufferIsPlanar(a) && !CVPixelBufferIsPlanar(b)) {
+      return video::same_plane(
+        {static_cast<const uint8_t *>(CVPixelBufferGetBaseAddress(a)), CVPixelBufferGetBytesPerRow(a), CVPixelBufferGetWidth(a) * 4, CVPixelBufferGetHeight(a)},
+        {static_cast<const uint8_t *>(CVPixelBufferGetBaseAddress(b)), CVPixelBufferGetBytesPerRow(b), CVPixelBufferGetWidth(b) * 4, CVPixelBufferGetHeight(b)}
+      );
+    }
+    std::size_t component_bytes;
+    if (format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+      component_bytes = 1;
+    } else if (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
+      component_bytes = 2;
+    } else {
+      return false;
+    }
+    if (CVPixelBufferGetPlaneCount(a) != 2 || CVPixelBufferGetPlaneCount(b) != 2) {
+      return false;
+    }
+    for (std::size_t plane = 0; plane < 2; ++plane) {
+      auto bytes_per_pixel = component_bytes * (plane == 0 ? 1 : 2);
+      if (!video::same_plane(
+            {static_cast<const uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(a, plane)), CVPixelBufferGetBytesPerRowOfPlane(a, plane), CVPixelBufferGetWidthOfPlane(a, plane) * bytes_per_pixel, CVPixelBufferGetHeightOfPlane(a, plane)},
+            {static_cast<const uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(b, plane)), CVPixelBufferGetBytesPerRowOfPlane(b, plane), CVPixelBufferGetWidthOfPlane(b, plane) * bytes_per_pixel, CVPixelBufferGetHeightOfPlane(b, plane)})) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   namespace {
     constexpr auto capture_poll_timeout = 250ms;

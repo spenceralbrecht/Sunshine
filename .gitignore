@@ -39,6 +39,8 @@
 
 # build directories
 build/
+build-host-install/
+codesign.entitlements
 cmake-*/
 docs/doxyconfig*
 

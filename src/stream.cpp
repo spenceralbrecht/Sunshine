@@ -33,6 +33,7 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#include "video_idle.h"
 
 #define IDX_START_A 0
 #define IDX_START_B 1
@@ -375,6 +376,7 @@ namespace stream {
       std::uint64_t gcm_iv_counter;
 
       safe::mail_raw_t::event_t<bool> idr_events;
+      safe::mail_raw_t::event_t<std::pair<bool, std::chrono::steady_clock::time_point>> cellular_idle_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
 
       std::unique_ptr<platf::deinit_t> qos;
@@ -952,6 +954,9 @@ namespace stream {
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
+      if (auto cellular = video::cellular_ping(payload)) {
+        session->video.cellular_idle_events->raise(std::make_pair(*cellular, std::chrono::steady_clock::now()));
+      }
     });
 
     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
@@ -2084,6 +2089,7 @@ namespace stream {
       };
 
       session->video.idr_events = mail->event<bool>(mail::idr);
+      session->video.cellular_idle_events = mail->event<std::pair<bool, std::chrono::steady_clock::time_point>>(mail::cellular_idle);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;

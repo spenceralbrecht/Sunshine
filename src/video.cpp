@@ -29,6 +29,7 @@ extern "C" {
 #include "platform/common.h"
 #include "sync.h"
 #include "video.h"
+#include "video_idle.h"
 
 #ifdef _WIN32
 extern "C" {
@@ -430,6 +431,7 @@ namespace video {
     safe::mail_raw_t::event_t<bool> shutdown_event;
     safe::mail_raw_t::queue_t<packet_t> packets;
     safe::mail_raw_t::event_t<bool> idr_events;
+    safe::mail_raw_t::event_t<std::pair<bool, std::chrono::steady_clock::time_point>> cellular_idle_events;
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;
 
@@ -441,6 +443,14 @@ namespace video {
   struct sync_session_t {
     sync_session_ctx_t *ctx;
     std::unique_ptr<encode_session_t> session;
+    cellular_idle_t idle_policy;
+    std::shared_ptr<platf::img_t> previous_image;
+    bool idle_enabled = false;
+    uint64_t idle_skipped = 0;
+    uint64_t encoded_frames = 0;
+    uint64_t payload_bytes = 0;
+    bool first_frame_reported = false;
+    bool idr_pending = false;
   };
 
   using encode_session_ctx_queue_t = safe::queue_t<sync_session_ctx_t>;
@@ -1371,7 +1381,7 @@ namespace video {
     }
   }
 
-  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp, uint64_t *payload_bytes = nullptr) {
     auto &frame = session.device->frame;
     frame->pts = frame_nr;
 
@@ -1439,6 +1449,9 @@ namespace video {
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
+      if (payload_bytes) {
+        *payload_bytes += packet->data_size();
+      }
       packets->raise(std::move(packet));
     }
 
@@ -1465,9 +1478,9 @@ namespace video {
     return 0;
   }
 
-  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp, uint64_t *payload_bytes = nullptr) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
-      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
+      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp, payload_bytes);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
     }
@@ -2143,6 +2156,12 @@ namespace video {
     }
 
     std::vector<sync_session_t> synced_sessions;
+    auto capture_summary = util::fail_guard([&] {
+      for (const auto &session : synced_sessions) {
+        BOOST_LOG(info) << "macOS capture session summary: encoded_frames=" << session.encoded_frames
+                        << " skipped_idle_frames=" << session.idle_skipped << " payload_bytes=" << session.payload_bytes;
+      }
+    });
     for (auto &ctx : synced_session_ctxs) {
       auto synced_session = make_synced_session(disp.get(), encoder, *img, *ctx);
       if (!synced_session) {
@@ -2179,6 +2198,8 @@ namespace video {
         KITTY_WHILE_LOOP(auto pos = std::begin(synced_sessions), pos != std::end(synced_sessions), {
           auto ctx = pos->ctx;
           if (ctx->shutdown_event->peek()) {
+            BOOST_LOG(info) << "macOS capture session summary: encoded_frames=" << pos->encoded_frames
+                            << " skipped_idle_frames=" << pos->idle_skipped << " payload_bytes=" << pos->payload_bytes;
             // Let waiting thread know it can delete shutdown_event
             ctx->join_event->raise(true);
 
@@ -2194,7 +2215,9 @@ namespace video {
             continue;
           }
 
-          if (ctx->idr_events->peek()) {
+          bool requested_idr = ctx->idr_events->peek();
+          if (requested_idr) {
+            pos->idr_pending = true;
             pos->session->request_idr_frame();
             ctx->idr_events->pop();
           }
@@ -2206,21 +2229,50 @@ namespace video {
             continue;
           }
 
-          if (pos->session->convert(*img)) {
+          if (auto cellular = ctx->cellular_idle_events->pop(0ms)) {
+#ifdef __APPLE__
+            pos->idle_policy.renew(cellular->first, cellular->second);
+#endif
+          }
+          auto now = std::chrono::steady_clock::now();
+          auto cellular_now = pos->idle_policy.enabled(now);
+          if (cellular_now != pos->idle_enabled) {
+            BOOST_LOG(info) << "Cellular idle encoding " << (cellular_now ? "enabled" : "disabled");
+            pos->idle_enabled = cellular_now;
+            pos->previous_image.reset();
+          }
+          bool changed = !pos->idle_enabled || !pos->previous_image || !img->same_pixels(*pos->previous_image);
+          if (!pos->idle_policy.should_encode(changed, pos->idr_pending, now)) {
+            ++pos->idle_skipped;
+            ++pos;
+            continue;
+          }
+          if (changed && pos->session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             ctx->shutdown_event->raise(true);
 
             continue;
           }
+          if (pos->idle_enabled && changed) {
+            pos->previous_image = img;
+          }
 
           std::optional<std::chrono::steady_clock::time_point> frame_timestamp = img->frame_timestamp;
 
-          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
+          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp, &pos->payload_bytes)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
 
             continue;
           }
+          ++pos->encoded_frames;
+          pos->idr_pending = false;
+#ifdef __APPLE__
+          if (!pos->first_frame_reported && pos->payload_bytes) {
+            BOOST_LOG(info) << "macOS capture stats: first encoded desktop frame, payload_bytes=" << pos->payload_bytes;
+            pos->first_frame_reported = true;
+          }
+#endif
 
           pos->session->request_normal_frame();
 
@@ -2235,7 +2287,15 @@ namespace video {
         return true;
       };
 
-      auto pull_free_image_callback = [&img](std::shared_ptr<platf::img_t> &img_out) -> bool {
+      auto pull_free_image_callback = [&img, &disp](std::shared_ptr<platf::img_t> &img_out) -> bool {
+        // A cellular session retains the last changed image for comparison.
+        // Do not overwrite that image object with the next capture.
+        if (img.use_count() > 1) {
+          img = disp->alloc_img();
+          if (!img) {
+            return false;
+          }
+        }
         img_out = img;
         img_out->frame_timestamp.reset();
         return true;
@@ -2385,6 +2445,7 @@ namespace video {
         mail->event<bool>(mail::shutdown),
         mail::man->queue<packet_t>(mail::video_packets),
         std::move(idr_events),
+        mail->event<std::pair<bool, std::chrono::steady_clock::time_point>>(mail::cellular_idle),
         mail->event<hdr_info_t>(mail::hdr),
         mail->event<input::touch_port_t>(mail::touch_port),
         config,
